@@ -519,8 +519,16 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
     // Profile version
     profile.push_str("(version 1)\n");
 
-    // Start with deny default
-    profile.push_str("(deny default)\n");
+    // Start with deny default, carrying the caller's message if it set one:
+    // the kernel logs it with every denial the default deny produces, for the
+    // whole sandboxed tree. Escaped as path strings are, for the same reasons.
+    match caps.seatbelt_deny_message() {
+        Some(message) => profile.push_str(&format!(
+            "(deny default (with message \"{}\"))\n",
+            escape_path(message)?
+        )),
+        None => profile.push_str("(deny default)\n"),
+    }
     if caps.seatbelt_debug_deny() {
         profile.push_str("(debug deny)\n");
     }
@@ -1122,6 +1130,43 @@ mod tests {
         assert!(profile.contains("literal \"/test.txt\""));
         // Write-only paths must NOT get file-map-executable
         assert!(!profile.contains("file-map-executable"));
+    }
+
+    #[test]
+    fn test_generate_profile_default_deny_has_no_message_by_default() {
+        let profile = generate_profile(&CapabilitySet::default()).unwrap();
+
+        assert!(profile.contains("(deny default)\n"));
+        assert!(!profile.contains("with message"));
+    }
+
+    #[test]
+    fn test_generate_profile_default_deny_carries_the_deny_message() {
+        let mut caps = CapabilitySet::default();
+        caps.set_seatbelt_deny_message(Some("playpen-run-01M45".to_string()));
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains("(deny default (with message \"playpen-run-01M45\"))\n"));
+        assert!(!profile.contains("(deny default)\n"));
+    }
+
+    #[test]
+    fn test_generate_profile_deny_message_is_escaped() {
+        let mut caps = CapabilitySet::default();
+        caps.set_seatbelt_deny_message(Some(r#"a"b\c"#.to_string()));
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains(r#"(deny default (with message "a\"b\\c"))"#));
+    }
+
+    #[test]
+    fn test_generate_profile_rejects_a_deny_message_with_a_control_character() {
+        let mut caps = CapabilitySet::default();
+        caps.set_seatbelt_deny_message(Some("a\nb".to_string()));
+
+        assert!(generate_profile(&caps).is_err());
     }
 
     #[test]

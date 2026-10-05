@@ -1002,6 +1002,11 @@ pub struct CapabilitySet {
     /// When set, the generated Seatbelt profile emits `(debug deny)` so
     /// sandboxd records denial events in the unified log.
     seatbelt_debug_deny: bool,
+    /// A message attached to the macOS Seatbelt default deny, which the kernel
+    /// appends to every denial it logs for the sandboxed process tree. Lets a
+    /// caller find one sandbox's denials, descendants included, without
+    /// knowing their pids.
+    seatbelt_deny_message: Option<String>,
     /// Resource ceilings (memory and max processes) for the sandboxed tree.
     /// Plumbed through here so they ride the serialization layer like other
     /// policy; enforced by the supervisor via cgroup v2 on Linux.
@@ -1462,6 +1467,12 @@ impl CapabilitySet {
         self.seatbelt_debug_deny = enabled;
     }
 
+    /// Attach a message to the macOS Seatbelt default deny, logged with every
+    /// denial in the sandboxed tree. `None`, the default, attaches nothing.
+    pub fn set_seatbelt_deny_message(&mut self, message: Option<String>) {
+        self.seatbelt_deny_message = message;
+    }
+
     /// Add to allowed commands list
     pub fn add_allowed_command(&mut self, cmd: impl Into<String>) {
         self.allowed_commands.push(cmd.into());
@@ -1722,6 +1733,12 @@ impl CapabilitySet {
     #[must_use]
     pub fn seatbelt_debug_deny(&self) -> bool {
         self.seatbelt_debug_deny
+    }
+
+    /// The message attached to the macOS Seatbelt default deny, if any.
+    #[must_use]
+    pub fn seatbelt_deny_message(&self) -> Option<&str> {
+        self.seatbelt_deny_message.as_deref()
     }
 
     /// Get allowed commands
