@@ -525,8 +525,9 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
         profile.push_str("(debug deny)\n");
     }
 
-    // Allow specific process operations needed for execution
-    profile.push_str("(allow process-exec*)\n");
+    // Allow specific process operations needed for execution. Exec is not
+    // granted here: it is path-scoped below, beside file-map-executable, so a
+    // capability set that grants nothing executes nothing.
     profile.push_str("(allow process-fork)\n");
 
     // Process info: allow self-inspection and same-sandbox inspection for both
@@ -644,9 +645,14 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
     // Allow mapping executables into memory, restricted to readable paths.
     // This prevents loading arbitrary shared libraries via DYLD_INSERT_LIBRARIES
     // from paths outside the sandbox's read set.
+    //
+    // Exec is gated on the same paths: the read set is the execute set. The
+    // wildcard form keeps process-exec-interpreter, so a shebang script runs
+    // when its interpreter is readable too.
     for cap in caps.fs_capabilities() {
         if matches!(cap.access, AccessMode::Read | AccessMode::ReadWrite) {
             for filter in path_filters_for_cap(cap)? {
+                profile.push_str(&format!("(allow process-exec* ({}))\n", filter));
                 profile.push_str(&format!("(allow file-map-executable ({}))\n", filter));
             }
         }
@@ -1116,6 +1122,41 @@ mod tests {
         assert!(profile.contains("literal \"/test.txt\""));
         // Write-only paths must NOT get file-map-executable
         assert!(!profile.contains("file-map-executable"));
+    }
+
+    #[test]
+    fn test_generate_profile_exec_is_gated_on_readable_paths() {
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/test"),
+            resolved: PathBuf::from("/test"),
+            access: AccessMode::Read,
+            is_file: false,
+            source: CapabilitySource::User,
+        });
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/out.txt"),
+            resolved: PathBuf::from("/out.txt"),
+            access: AccessMode::Write,
+            is_file: true,
+            source: CapabilitySource::User,
+        });
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains("(allow process-exec* (subpath \"/test\"))"));
+        // Write-only paths must NOT be executable
+        assert!(!profile.contains("(allow process-exec* (literal \"/out.txt\"))"));
+    }
+
+    #[test]
+    fn test_generate_profile_no_global_process_exec() {
+        let caps = CapabilitySet::default();
+        let profile = generate_profile(&caps).unwrap();
+
+        // Must not contain a global (unrestricted) process-exec: an empty
+        // capability set grants no exec at all
+        assert!(!profile.contains("process-exec"));
     }
 
     #[test]
