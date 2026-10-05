@@ -1141,6 +1141,25 @@ mod tests {
     }
 
     #[test]
+    fn test_generate_profile_deny_message_changes_only_the_default_deny() {
+        let mut caps = CapabilitySet::new()
+            .allow_path("/usr", AccessMode::Read)
+            .unwrap();
+        let without = generate_profile(&caps).unwrap();
+        caps.set_seatbelt_deny_message(Some("tag".to_string()));
+        let with = generate_profile(&caps).unwrap();
+
+        // Byte for byte the same profile, but for the one rule the message is on.
+        assert_eq!(
+            with.replace(
+                "(deny default (with message \"tag\"))\n",
+                "(deny default)\n"
+            ),
+            without
+        );
+    }
+
+    #[test]
     fn test_generate_profile_default_deny_carries_the_deny_message() {
         let mut caps = CapabilitySet::default();
         caps.set_seatbelt_deny_message(Some("playpen-run-01M45".to_string()));
