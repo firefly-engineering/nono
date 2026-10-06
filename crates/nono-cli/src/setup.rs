@@ -202,7 +202,14 @@ impl SetupRunner {
             );
         }
 
-        println!("  * Linux AF_UNIX mediation: off by default");
+        if detected.has_resolve_unix() {
+            println!("  * Landlock pathname socket policy:");
+            println!(
+                "    - connect(2) to a pathname AF_UNIX socket requires a write or readwrite grant covering it"
+            );
+        }
+
+        println!("  * Linux AF_UNIX mediation (seccomp): off by default");
         println!("    - For stricter IPC isolation, set linux.af_unix_mediation = \"pathname\"");
         println!("    - Then grant required pathname sockets with filesystem.unix_socket entries");
         println!(

@@ -311,9 +311,17 @@ impl DetectedAbi {
     }
 
     /// Whether execute access control is supported strongly enough for command sandbox execution.
+    ///
+    /// `AccessFs::Execute` alone exists since V1, but every caller of this
+    /// predicate gates an execute-restriction Landlock layer that is documented
+    /// as requiring V3+, so the V3 floor is part of the contract. It is
+    /// expressed against the crate's own access table — `Truncate` is exactly
+    /// the V3 marker — rather than an ABI whitelist, because a whitelist
+    /// silently answers `false` for every ABI added later.
     #[must_use]
     pub fn has_execute(&self) -> bool {
-        matches!(self.abi, ABI::V3 | ABI::V4 | ABI::V5 | ABI::V6)
+        let available = AccessFs::from_all(self.abi);
+        available.contains(AccessFs::Execute) && available.contains(AccessFs::Truncate)
     }
 
     /// Whether TCP network filtering is supported (V4+).
@@ -334,6 +342,26 @@ impl DetectedAbi {
         !Scope::from_all(self.abi).is_empty()
     }
 
+    /// Whether `connect(2)` to a pathname AF_UNIX socket is mediated (V9+).
+    ///
+    /// When this is true, `AccessFs::ResolveUnix` is a handled access right, so
+    /// a pathname-socket `connect(2)` is denied unless the socket sits under a
+    /// writable grant. See [`access_to_landlock`].
+    #[must_use]
+    pub fn has_resolve_unix(&self) -> bool {
+        AccessFs::from_all(self.abi).contains(AccessFs::ResolveUnix)
+    }
+
+    /// Whether the kernel accepts the `landlock_restrict_self()` audit-logging
+    /// flags, in particular `LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON` (V7+).
+    ///
+    /// Without this, a denial that happens after the sandboxer `execve(2)`s its
+    /// target produces no audit record at all.
+    #[must_use]
+    pub fn has_audit_logging(&self) -> bool {
+        self.abi >= ABI::V7
+    }
+
     /// Return a human-readable version string (e.g., "V4").
     #[must_use]
     pub fn version_string(&self) -> &'static str {
@@ -344,6 +372,9 @@ impl DetectedAbi {
             ABI::V4 => "V4",
             ABI::V5 => "V5",
             ABI::V6 => "V6",
+            ABI::V7 => "V7",
+            ABI::V8 => "V8",
+            ABI::V9 => "V9",
             _ => "unknown",
         }
     }
@@ -369,6 +400,12 @@ impl DetectedAbi {
         }
         if self.has_scoping() {
             features.push("Signal and abstract UNIX socket scoping".to_string());
+        }
+        if self.has_audit_logging() {
+            features.push("Audit logging flags (log_new_exec)".to_string());
+        }
+        if self.has_resolve_unix() {
+            features.push("Pathname UNIX socket connect (ResolveUnix)".to_string());
         }
         features
     }
@@ -413,11 +450,21 @@ impl std::fmt::Display for DetectedAbi {
 }
 
 /// ABI probe order: highest to lowest.
-const ABI_PROBE_ORDER: [ABI; 6] = [ABI::V6, ABI::V5, ABI::V4, ABI::V3, ABI::V2, ABI::V1];
+const ABI_PROBE_ORDER: [ABI; 9] = [
+    ABI::V9,
+    ABI::V8,
+    ABI::V7,
+    ABI::V6,
+    ABI::V5,
+    ABI::V4,
+    ABI::V3,
+    ABI::V2,
+    ABI::V1,
+];
 
 /// Detect the highest Landlock ABI supported by the running kernel.
 ///
-/// Probes from V6 down to V1 using `HardRequirement` compatibility mode.
+/// Probes from V9 down to V1 using `HardRequirement` compatibility mode.
 /// Returns the highest ABI for which a full ruleset can be created.
 ///
 /// The result is cached after the first call since the kernel ABI does not
@@ -595,6 +642,13 @@ struct LandlockAccess {
 /// `normalize_path_access()` only for opened inodes that are actual device files
 /// (char/block devices) or intended device directories. This avoids granting
 /// device ioctl access to non-device paths.
+///
+/// ResolveUnix (V9+) is on the write side, so `connect(2)` or `sendmsg(2)` to a
+/// pathname AF_UNIX socket succeeds exactly when the socket sits under a
+/// `readwrite`/`write` grant and is denied under a `read`-only grant or no grant
+/// at all. Because `AccessFs::from_all(ABI::V9)` carries ResolveUnix, it is a
+/// *handled* access on a V9 kernel and therefore denied by default; below V9 the
+/// `desired & available` intersection drops it into `dropped`.
 fn access_to_landlock(access: AccessMode, abi: ABI) -> LandlockAccess {
     let available = AccessFs::from_all(abi);
 
@@ -613,6 +667,7 @@ fn access_to_landlock(access: AccessMode, abi: ABI) -> LandlockAccess {
                 | AccessFs::RemoveDir
                 | AccessFs::Refer
                 | AccessFs::Truncate
+                | AccessFs::ResolveUnix
         }
         AccessMode::ReadWrite => {
             let read = access_to_landlock(AccessMode::Read, abi);
@@ -1282,11 +1337,17 @@ fn apply_with_abi_inner(
     // Failing silently would violate the principle of least surprise and
     // fail-secure design.
     //
-    // Pathname AF_UNIX socket grants currently enter Linux enforcement only
-    // through their implied FsCapability. Landlock PathBeneath is recursive for
-    // directory grants, so SocketScope::DirChildren and SocketScope::DirSubtree
-    // are not distinguishable on this Linux path until the seccomp AF_UNIX
-    // allowlist work enforces UnixSocketCapability::covers().
+    // Pathname AF_UNIX socket grants enter Linux enforcement through their
+    // implied FsCapability. On Landlock V9+ that is real mediation: ResolveUnix
+    // is a handled access right, so connect(2)/sendmsg(2) to a pathname socket
+    // is denied unless the socket is under a writable grant. Below V9 the right
+    // does not exist and the implied FsCapability only governs opening the
+    // socket's inode, not connecting to it.
+    //
+    // Either way, Landlock PathBeneath is recursive for directory grants, so
+    // SocketScope::DirChildren and SocketScope::DirSubtree are not
+    // distinguishable on this Linux path until the seccomp AF_UNIX allowlist
+    // work enforces UnixSocketCapability::covers().
     // Track device IDs of mounts already warned about to emit one warning
     // per mount, not one per capability path.
     let mut warned_unsupported_devs: std::collections::HashSet<u64> =
@@ -3832,7 +3893,9 @@ mod tests {
         assert!(write.effective.contains(AccessFs::Refer));
         assert!(write.effective.contains(AccessFs::Truncate));
         assert!(!write.effective.contains(AccessFs::IoctlDev));
-        assert!(write.dropped.is_empty());
+        // ResolveUnix only exists from V9, so V3 reports it as dropped.
+        assert!(!write.effective.contains(AccessFs::ResolveUnix));
+        assert_eq!(write.dropped, BitFlags::from(AccessFs::ResolveUnix));
 
         let rw = access_to_landlock(AccessMode::ReadWrite, abi);
         assert!(rw.effective.contains(AccessFs::ReadFile));
@@ -3841,7 +3904,7 @@ mod tests {
         assert!(rw.effective.contains(AccessFs::RemoveDir));
         assert!(rw.effective.contains(AccessFs::Refer));
         assert!(rw.effective.contains(AccessFs::Truncate));
-        assert!(rw.dropped.is_empty());
+        assert_eq!(rw.dropped, BitFlags::from(AccessFs::ResolveUnix));
     }
 
     #[test]
@@ -3860,6 +3923,7 @@ mod tests {
         // Dropped flags should be reported
         assert!(write.dropped.contains(AccessFs::Refer));
         assert!(write.dropped.contains(AccessFs::Truncate));
+        assert!(write.dropped.contains(AccessFs::ResolveUnix));
     }
 
     #[test]
@@ -3874,6 +3938,7 @@ mod tests {
         assert!(!write.effective.contains(AccessFs::IoctlDev));
         // Truncate should be in dropped
         assert!(write.dropped.contains(AccessFs::Truncate));
+        assert!(write.dropped.contains(AccessFs::ResolveUnix));
         assert!(!write.dropped.contains(AccessFs::Refer));
     }
 
@@ -3891,6 +3956,49 @@ mod tests {
 
         let read = access_to_landlock(AccessMode::Read, abi);
         assert!(!read.effective.contains(AccessFs::IoctlDev));
+
+        // V5 predates ResolveUnix, so it is reported as dropped on the write side.
+        assert!(write.dropped.contains(AccessFs::ResolveUnix));
+        assert!(rw.dropped.contains(AccessFs::ResolveUnix));
+        assert!(read.dropped.is_empty());
+    }
+
+    #[test]
+    fn test_access_conversion_v9_gates_resolve_unix_on_write() {
+        let abi = ABI::V9;
+
+        // ResolveUnix is a write-side right: connect(2) to a pathname AF_UNIX
+        // socket needs a write or readwrite grant covering the socket.
+        let write = access_to_landlock(AccessMode::Write, abi);
+        assert!(write.effective.contains(AccessFs::ResolveUnix));
+        assert!(write.dropped.is_empty());
+
+        let rw = access_to_landlock(AccessMode::ReadWrite, abi);
+        assert!(rw.effective.contains(AccessFs::ResolveUnix));
+        assert!(rw.dropped.is_empty());
+
+        let read = access_to_landlock(AccessMode::Read, abi);
+        assert!(!read.effective.contains(AccessFs::ResolveUnix));
+        assert!(read.dropped.is_empty());
+
+        // The right is in the kernel's handled set at V9, which is what makes
+        // "no grant" mean "denied" rather than "unmediated".
+        assert!(AccessFs::from_all(ABI::V9).contains(AccessFs::ResolveUnix));
+    }
+
+    #[test]
+    fn test_access_conversion_v6_drops_resolve_unix() {
+        let write = access_to_landlock(AccessMode::Write, ABI::V6);
+        assert!(!write.effective.contains(AccessFs::ResolveUnix));
+        assert!(write.dropped.contains(AccessFs::ResolveUnix));
+    }
+
+    #[test]
+    fn test_resolve_unix_survives_file_normalization() {
+        // ACCESS_FILE in the landlock crate includes ResolveUnix, so narrowing a
+        // non-directory rule with from_file() must not strip it — a pathname
+        // socket is a non-directory inode.
+        assert!(AccessFs::from_file(ABI::V9).contains(AccessFs::ResolveUnix));
     }
 
     #[test]
@@ -4020,6 +4128,37 @@ mod tests {
 
         let v6 = DetectedAbi::new(ABI::V6);
         assert!(v6.has_scoping());
+        assert!(!v6.has_audit_logging());
+        assert!(!v6.has_resolve_unix());
+
+        // has_execute() used to be an ABI whitelist capped at V6, which silently
+        // answered false for every newer ABI.
+        for abi in [ABI::V7, ABI::V8, ABI::V9] {
+            let detected = DetectedAbi::new(abi);
+            assert!(detected.has_execute(), "{abi:?} must report has_execute");
+            assert!(detected.has_refer());
+            assert!(detected.has_truncate());
+            assert!(detected.has_network());
+            assert!(detected.has_ioctl_dev());
+            assert!(detected.has_scoping());
+            assert!(detected.has_audit_logging(), "audit logging lands at V7");
+        }
+
+        // ResolveUnix lands at V9 only.
+        assert!(!DetectedAbi::new(ABI::V7).has_resolve_unix());
+        assert!(!DetectedAbi::new(ABI::V8).has_resolve_unix());
+        assert!(DetectedAbi::new(ABI::V9).has_resolve_unix());
+
+        for abi in [ABI::V1, ABI::V2, ABI::V3, ABI::V4, ABI::V5, ABI::V6] {
+            assert!(
+                !DetectedAbi::new(abi).has_resolve_unix(),
+                "{abi:?} predates ResolveUnix"
+            );
+            assert!(
+                !DetectedAbi::new(abi).has_audit_logging(),
+                "{abi:?} predates the audit logging flags"
+            );
+        }
     }
 
     #[test]
@@ -4533,17 +4672,307 @@ mod tests {
         assert_eq!(full_report[0], 0, "IpcMode::Full connect was denied");
     }
 
+    /// Bind and listen on a pathname AF_UNIX socket, returning its fd.
+    #[cfg(target_os = "linux")]
+    fn bind_pathname_listener(path: &Path) -> FdGuard {
+        // SAFETY: socket is called with constant domain/type/protocol values.
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        assert!(fd >= 0, "socket(AF_UNIX) failed");
+        let guard = FdGuard(fd);
+
+        let (addr, addr_len) = pathname_sockaddr(path).expect("socket path fits in sun_path");
+
+        // SAFETY: addr points to a valid sockaddr_un and addr_len covers initialized bytes.
+        let bind_result = unsafe {
+            libc::bind(
+                guard.0,
+                (&addr as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+                addr_len,
+            )
+        };
+        assert_eq!(bind_result, 0, "bind(AF_UNIX pathname) failed");
+
+        // SAFETY: guard.0 is a valid stream socket created above.
+        let listen_result = unsafe { libc::listen(guard.0, 4) };
+        assert_eq!(listen_result, 0, "listen(AF_UNIX pathname) failed");
+        guard
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pathname_sockaddr(path: &Path) -> Option<(libc::sockaddr_un, libc::socklen_t)> {
+        use std::os::unix::ffi::OsStrExt;
+
+        let bytes = path.as_os_str().as_bytes();
+        // SAFETY: sockaddr_un is a plain C struct; zero initialization is valid.
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        if bytes.len().saturating_add(1) > addr.sun_path.len() {
+            return None;
+        }
+
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (index, byte) in bytes.iter().enumerate() {
+            addr.sun_path[index] = *byte as libc::c_char;
+        }
+
+        let addr_len = std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1;
+        Some((addr, addr_len as libc::socklen_t))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn connect_pathname_socket(path: &Path) -> (bool, i32) {
+        // SAFETY: socket is called with constant domain/type/protocol values.
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        if fd < 0 {
+            return (
+                false,
+                std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(255),
+            );
+        }
+        let guard = FdGuard(fd);
+
+        let (addr, addr_len) = match pathname_sockaddr(path) {
+            Some(sockaddr) => sockaddr,
+            None => return (false, libc::EINVAL),
+        };
+
+        // SAFETY: addr points to a valid sockaddr_un and addr_len covers initialized bytes.
+        let connect_result = unsafe {
+            libc::connect(
+                guard.0,
+                (&addr as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+                addr_len,
+            )
+        };
+        if connect_result == 0 {
+            (true, 0)
+        } else {
+            (
+                false,
+                std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(255),
+            )
+        }
+    }
+
+    /// Fork, apply `caps`, then `connect(2)` to each path in `paths` in order.
+    ///
+    /// Returns two bytes per path: `0`/`1` for connected/denied, then the errno
+    /// truncated to a `u8`. A leading `[2, 0]` pair means the sandbox itself
+    /// failed to apply.
+    #[cfg(target_os = "linux")]
+    fn run_pathname_connect_probe<const N: usize>(
+        paths: &[&Path; N],
+        listener_fds: &[libc::c_int],
+        caps: CapabilitySet,
+        detected: DetectedAbi,
+    ) -> [u8; N] {
+        let mut report_pipe = [0; 2];
+        // SAFETY: report_pipe points to two writable file descriptor slots.
+        let pipe_result = unsafe { libc::pipe(report_pipe.as_mut_ptr()) };
+        assert_eq!(pipe_result, 0, "pipe() failed");
+
+        // Resolve every connect target before forking: the child runs under the
+        // sandbox and must not allocate or touch unrelated paths.
+        let owned: Vec<PathBuf> = paths.iter().map(|p| p.to_path_buf()).collect();
+
+        // SAFETY: fork is used in a test helper; the child exits via _exit.
+        let child_pid = unsafe { libc::fork() };
+        assert!(child_pid >= 0, "fork() for pathname socket probe failed");
+
+        if child_pid == 0 {
+            let mut payload = [u8::MAX; N];
+            let mut errnos = [0_u8; N];
+            // SAFETY: these are inherited file descriptors in the child process.
+            unsafe {
+                libc::close(report_pipe[0]);
+                for fd in listener_fds {
+                    libc::close(*fd);
+                }
+            }
+
+            let exit_code = match apply_auto_with_abi(&caps, &detected) {
+                Ok(_) => {
+                    for (slot, path) in owned.iter().enumerate() {
+                        let (connected, errno) = connect_pathname_socket(path);
+                        payload[slot] = u8::from(!connected);
+                        errnos[slot] = errno_to_u8(errno);
+                    }
+                    0
+                }
+                Err(_) => 4,
+            };
+
+            // SAFETY: both buffers are valid and report_pipe[1] is the write end.
+            let wrote = unsafe {
+                let a = libc::write(
+                    report_pipe[1],
+                    payload.as_ptr().cast::<libc::c_void>(),
+                    payload.len(),
+                );
+                let b = libc::write(
+                    report_pipe[1],
+                    errnos.as_ptr().cast::<libc::c_void>(),
+                    errnos.len(),
+                );
+                (a, b)
+            };
+            let expected = isize::try_from(N).unwrap_or(-1);
+            let exit_code = if wrote == (expected, expected) {
+                exit_code
+            } else {
+                3
+            };
+            // SAFETY: close operates on the inherited pipe fd; _exit terminates the child.
+            unsafe {
+                libc::close(report_pipe[1]);
+                libc::_exit(exit_code);
+            }
+        }
+
+        // SAFETY: parent no longer writes to the pipe.
+        unsafe {
+            libc::close(report_pipe[1]);
+        }
+
+        let mut child_status = 0;
+        // SAFETY: child_pid is the pid returned by fork in the parent.
+        let waited = unsafe { libc::waitpid(child_pid, &mut child_status, 0) };
+        assert_eq!(waited, child_pid, "waitpid() for probe child failed");
+        assert!(
+            libc::WIFEXITED(child_status),
+            "pathname socket probe child did not exit normally"
+        );
+
+        let mut denied = [0_u8; N];
+        let mut errnos = [0_u8; N];
+        for buf in [&mut denied, &mut errnos] {
+            // SAFETY: buf is a valid writable buffer and report_pipe[0] is the read end.
+            let read_result = unsafe {
+                libc::read(
+                    report_pipe[0],
+                    buf.as_mut_ptr().cast::<libc::c_void>(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(
+                read_result,
+                isize::try_from(N).unwrap_or(-1),
+                "failed to read pathname socket probe report"
+            );
+        }
+        // SAFETY: parent is done reading from the pipe.
+        unsafe {
+            libc::close(report_pipe[0]);
+        }
+
+        assert_eq!(
+            libc::WEXITSTATUS(child_status),
+            0,
+            "pathname socket probe child returned failure (denied={denied:?}, errno={errnos:?})"
+        );
+
+        for (slot, errno) in errnos.iter().enumerate() {
+            if denied[slot] == 1 {
+                assert_eq!(
+                    i32::from(*errno),
+                    libc::EACCES,
+                    "pathname connect denial {slot} should be EACCES"
+                );
+            }
+        }
+        denied
+    }
+
+    /// `ResolveUnix` (Landlock V9+) makes `connect(2)` to a pathname AF_UNIX
+    /// socket a write-side filesystem right.
+    ///
+    /// Both halves matter: a socket under a `readwrite` grant must still be
+    /// reachable, otherwise a build that simply denies everything would pass.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_resolve_unix_gates_pathname_connect_on_v9() {
+        let Ok(detected) = detect_abi() else {
+            return;
+        };
+        if !detected.has_resolve_unix() {
+            return;
+        }
+
+        let writable = tempfile::tempdir().expect("writable tempdir");
+        let ungranted = tempfile::tempdir().expect("ungranted tempdir");
+        let readonly = tempfile::tempdir().expect("read-only tempdir");
+
+        let writable_sock = writable.path().join("s");
+        let ungranted_sock = ungranted.path().join("s");
+        let readonly_sock = readonly.path().join("s");
+
+        let writable_listener = bind_pathname_listener(&writable_sock);
+        let ungranted_listener = bind_pathname_listener(&ungranted_sock);
+        let readonly_listener = bind_pathname_listener(&readonly_sock);
+
+        let caps = CapabilitySet::new()
+            .set_signal_mode(SignalMode::AllowAll)
+            .set_ipc_mode(IpcMode::Full)
+            .allow_path(writable.path(), AccessMode::ReadWrite)
+            .expect("grant writable dir")
+            .allow_path(readonly.path(), AccessMode::Read)
+            .expect("grant read-only dir");
+
+        let report = run_pathname_connect_probe(
+            &[
+                writable_sock.as_path(),
+                ungranted_sock.as_path(),
+                readonly_sock.as_path(),
+            ],
+            &[
+                writable_listener.0,
+                ungranted_listener.0,
+                readonly_listener.0,
+            ],
+            caps,
+            detected,
+        );
+
+        assert_eq!(
+            report[0], 0,
+            "connect to a socket under a readwrite grant must succeed"
+        );
+        assert_eq!(
+            report[1], 1,
+            "connect to a socket outside every grant must be denied"
+        );
+        assert_eq!(
+            report[2], 1,
+            "connect to a socket under a read-only grant must be denied"
+        );
+    }
+
     #[test]
     fn test_detected_abi_version_string() {
         assert_eq!(DetectedAbi::new(ABI::V1).version_string(), "V1");
         assert_eq!(DetectedAbi::new(ABI::V4).version_string(), "V4");
         assert_eq!(DetectedAbi::new(ABI::V6).version_string(), "V6");
+        assert_eq!(DetectedAbi::new(ABI::V7).version_string(), "V7");
+        assert_eq!(DetectedAbi::new(ABI::V8).version_string(), "V8");
+        assert_eq!(DetectedAbi::new(ABI::V9).version_string(), "V9");
+        // Every ABI the probe can select must render, not fall into "unknown".
+        for abi in ABI_PROBE_ORDER {
+            assert_ne!(
+                DetectedAbi::new(abi).version_string(),
+                "unknown",
+                "{abi:?} has no version_string arm"
+            );
+        }
     }
 
     #[test]
     fn test_detected_abi_display() {
         let d = DetectedAbi::new(ABI::V4);
         assert_eq!(format!("{}", d), "Landlock V4");
+        assert_eq!(format!("{}", DetectedAbi::new(ABI::V9)), "Landlock V9");
     }
 
     #[test]
@@ -4569,6 +4998,19 @@ mod tests {
             names
                 .iter()
                 .any(|n| n == "Signal and abstract UNIX socket scoping")
+        );
+        assert!(!names.iter().any(|n| n.contains("ResolveUnix")));
+        assert!(!names.iter().any(|n| n.contains("log_new_exec")));
+
+        let v7 = DetectedAbi::new(ABI::V7).feature_names();
+        assert!(v7.iter().any(|n| n == "Audit logging flags (log_new_exec)"));
+        assert!(!v7.iter().any(|n| n.contains("ResolveUnix")));
+
+        let v9 = DetectedAbi::new(ABI::V9).feature_names();
+        assert!(v9.iter().any(|n| n == "Audit logging flags (log_new_exec)"));
+        assert!(
+            v9.iter()
+                .any(|n| n == "Pathname UNIX socket connect (ResolveUnix)")
         );
     }
 
