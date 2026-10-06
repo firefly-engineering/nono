@@ -911,7 +911,15 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
         }
         NetworkMode::AllowAll => {
             profile.push_str("(allow system-socket)\n");
-            profile.push_str("(allow network-outbound)\n");
+            // IP only: Seatbelt classifies a unix-socket connect(2) as
+            // network-outbound too, and a blanket allow would reach every
+            // credential oracle on the host (ssh-agent, gpg-agent,
+            // docker.sock). Unix sockets take the explicit-grant path below.
+            // The resolver's grant is unconditional here: block_dns() has no
+            // effect in AllowAll, as documented.
+            profile.push_str("(allow network-outbound (remote ip))\n");
+            profile.push_str(MDNS_RULES);
+            emit_unix_socket_rules(&mut profile, caps)?;
             profile.push_str("(allow network-inbound)\n");
             profile.push_str("(allow network-bind)\n");
         }
@@ -1001,8 +1009,8 @@ mod tests {
 
         assert!(profile.contains("(version 1)"));
         assert!(profile.contains("(deny default)"));
-        // Network is allowed by default
-        assert!(profile.contains("(allow network-outbound)"));
+        // IP network is allowed by default
+        assert!(profile.contains("(allow network-outbound (remote ip))"));
     }
 
     /// Repro for tls-intercept-qa T2 failure: `head <SSL_CERT_FILE>` returned
@@ -1460,7 +1468,7 @@ mod tests {
             .find("(deny file-write-unlink)")
             .expect("platform rule not found");
         let network_pos = profile
-            .find("(allow network-outbound)")
+            .find("(allow network-outbound (remote ip))")
             .expect("network rule not found");
         assert!(
             platform_pos < network_pos,
@@ -1872,7 +1880,8 @@ mod tests {
         let caps = CapabilitySet::new();
         let profile = generate_profile(&caps).unwrap();
 
-        assert!(profile.contains("(allow network-outbound)"));
+        assert!(profile.contains("(allow network-outbound (remote ip))\n"));
+        assert!(!profile.contains("(allow network-outbound)\n"));
         assert!(profile.contains("(allow network-inbound)"));
         assert!(profile.contains("(allow network-bind)"));
         assert!(!profile.contains("(deny network*)"));
@@ -2147,9 +2156,10 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_profile_unix_socket_rules_not_emitted_in_allow_all() {
-        // AllowAll already permits all network-outbound — emit_unix_socket_rules
-        // is only called in Blocked/ProxyOnly branches, so there's no per-path noise.
+    fn test_generate_profile_allow_all_grants_unix_sockets_explicitly() {
+        // Seatbelt counts a unix-socket connect(2) as network-outbound, so
+        // AllowAll renders outbound as IP-only and reaches unix sockets only
+        // through explicit grants, keeping the resolver's.
         let mut caps = CapabilitySet::new(); // default = AllowAll
         caps.add_unix_socket(crate::UnixSocketCapability {
             original: PathBuf::from("/tmp/test.sock"),
@@ -2162,13 +2172,13 @@ mod tests {
         let profile = generate_profile(&caps).unwrap();
 
         assert!(
-            profile.contains("(allow network-outbound)\n"),
-            "AllowAll must still emit blanket rule"
+            !profile.contains("(allow network-outbound)\n"),
+            "AllowAll must not grant every unix socket"
         );
-        assert!(
-            !profile.contains("(allow network-outbound (path \"/private/tmp/test.sock\"))"),
-            "AllowAll must not emit per-path socket rules"
-        );
+        assert!(profile.contains("(allow network-outbound (remote ip))\n"));
+        assert!(profile.contains("(allow network-outbound (path \"/private/tmp/test.sock\"))"));
+        assert!(profile.contains("(allow network-outbound (path \"/tmp/test.sock\"))"));
+        assert!(profile.contains("(allow network-outbound (path \"/var/run/mDNSResponder\"))"));
     }
 
     #[test]
@@ -2354,7 +2364,7 @@ mod tests {
         let caps = CapabilitySet::new().allow_localhost_port(3000);
         let profile = generate_profile(&caps).unwrap();
 
-        assert!(profile.contains("(allow network-outbound)"));
+        assert!(profile.contains("(allow network-outbound (remote ip))"));
         assert!(profile.contains("(allow network-inbound)"));
         assert!(profile.contains("(allow network-bind)"));
         assert!(!profile.contains("(deny network*)"));
@@ -2468,14 +2478,16 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_profile_dns_not_needed_in_allow_all() {
-        // AllowAll already permits all network — no special mDNSResponder
-        // rules needed (and none should appear since there's no deny network*).
+    fn test_generate_profile_dns_allowed_in_allow_all() {
+        // AllowAll's outbound is IP-only, so DNS needs the resolver's socket
+        // granted explicitly (#588).
         let caps = CapabilitySet::new();
         let profile = generate_profile(&caps).unwrap();
 
         assert!(!profile.contains("(deny network*)"));
-        assert!(!profile.contains("mDNSResponder"));
+        assert!(
+            profile.contains("(allow network-outbound (path \"/private/var/run/mDNSResponder\"))")
+        );
     }
 
     #[test]
