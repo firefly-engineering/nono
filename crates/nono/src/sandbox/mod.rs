@@ -21,7 +21,8 @@ pub use macos::{extension_consume, extension_issue_file, extension_release};
 // Re-export Linux Landlock ABI detection and scope policy reporting
 #[cfg(target_os = "linux")]
 pub use linux::{
-    DetectedAbi, LandlockScopePolicy, detect_abi, landlock_scope_policy, restrict_execute,
+    DetectedAbi, LANDLOCK_LOG_NEW_EXEC_REQUESTED, LandlockScopePolicy, detect_abi,
+    landlock_scope_policy, restrict_execute,
 };
 
 // Re-export Linux WSL2 detection

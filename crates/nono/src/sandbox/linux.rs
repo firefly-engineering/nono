@@ -19,6 +19,32 @@ use tracing::{debug, info, warn};
 const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
 const LANDLOCK_RULE_NET_PORT: u32 = 2;
 
+/// Whether this build of the Linux backend asks the kernel to keep auditing
+/// Landlock denials after the sandboxed process `execve(2)`s its target.
+///
+/// This is a property of *this build* of the backend, not of the running
+/// kernel: it is `true` because [`apply_landlock`]/[`apply_auto`] call
+/// `log_new_exec(true)` on the ruleset before `restrict_self()`. Reading it
+/// requires no syscall and no kernel of any particular version, which is the
+/// point — an embedder can check it at startup, or even at compile time.
+///
+/// Landlock's own defaults are `LOG_SAME_EXEC` on and `LOG_NEW_EXEC` *off*, so
+/// a sandboxer that execs its target gets no audit record for any denial the
+/// target hits. Embedders that turn `audit.log` denial records into a user-
+/// facing denial trace therefore read this constant as a precondition: a
+/// backend that answers `false` can never produce the records their trace is
+/// built from. (nono's downstream `playpen` refuses to run in that case rather
+/// than silently reporting an empty trace.)
+///
+/// Whether the *kernel* honours the request is a separate question — the flags
+/// need Landlock ABI 7+, which [`DetectedAbi::has_audit_logging`] reports and
+/// `RestrictionStatus::log_new_exec` confirms after the fact.
+///
+/// This constant must be kept in step with the actual `log_new_exec(true)`
+/// call site; `tests::landlock_log_new_exec_requested_matches_restrict_self`
+/// asserts the two agree on a kernel that supports the flag.
+pub const LANDLOCK_LOG_NEW_EXEC_REQUESTED: bool = true;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct RawLandlockRulesetAttr {
@@ -249,6 +275,12 @@ impl PreparedLandlockSandbox {
                 });
             }
 
+            // The flags argument is 0: this path deliberately does NOT request
+            // LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON, unlike `apply_with_abi_inner`.
+            // It runs post-`clone(2)` in an allocation-free context where the
+            // flag's ABI-7 availability cannot be probed without risking a
+            // failing syscall in a child that has no way to report it, so
+            // `LANDLOCK_LOG_NEW_EXEC_REQUESTED` does not describe this path.
             if libc::syscall(libc::SYS_landlock_restrict_self, ruleset_fd, 0_u32) < 0 {
                 let errno = raw_errno();
                 libc::syscall(libc::SYS_close, ruleset_fd);
@@ -1408,10 +1440,43 @@ fn apply_with_abi_inner(
             })?;
     }
 
+    // Request audit logging for denials that happen after the sandboxed process
+    // execve(2)s its target. The kernel default is LOG_SAME_EXEC on and
+    // LOG_NEW_EXEC off, so a sandboxer that execs — which is nono's whole shape —
+    // otherwise produces no audit record for any denial the target hits.
+    //
+    // Gated on the detected ABI so a pre-V7 kernel is not pushed from
+    // FullyEnforced to PartiallyEnforced merely by asking for a logging flag:
+    // the landlock crate's BestEffort path drops an unsupported syscall flag but
+    // marks the compatibility state Partial while doing so.
+    let ruleset = if abi.has_audit_logging() {
+        ruleset.log_new_exec(true).map_err(|e| {
+            NonoError::SandboxInit(format!("Failed to request new-exec audit logging: {}", e))
+        })?
+    } else {
+        warn!(
+            "Landlock ABI {:?} predates audit logging flags (V7+); denials after exec will not be logged",
+            target_abi
+        );
+        ruleset
+    };
+
     // Apply the ruleset - THIS IS IRREVERSIBLE
     let status = ruleset
         .restrict_self()
         .map_err(|e| NonoError::SandboxInit(format!("Failed to restrict self: {}", e)))?;
+
+    if abi.has_audit_logging() && !status.log_new_exec {
+        warn!(
+            "Landlock accepted the ruleset but new-exec audit logging was dropped; \
+             denials after exec will not be logged"
+        );
+    } else {
+        debug!(
+            "Landlock audit logging: same-exec={}, new-exec={}, subdomains={}",
+            status.log_same_exec, status.log_new_exec, status.log_subdomains
+        );
+    }
 
     match status.ruleset {
         landlock::RulesetStatus::FullyEnforced => {
@@ -1536,11 +1601,30 @@ pub fn restrict_execute(paths: &[impl AsRef<Path>]) -> Result<()> {
             })?;
     }
 
+    // This layer is its own Landlock domain, and a denial it produces — a
+    // blocked execve of a non-allowlisted binary — is by construction a
+    // post-exec event, so new-exec logging is exactly the flag that makes it
+    // auditable. Gated on the ABI because `ensure_execute_restriction_fully_
+    // enforced` rejects PartiallyEnforced, and asking for an unsupported
+    // syscall flag under BestEffort is itself enough to make the status Partial.
+    if abi.has_audit_logging() {
+        ruleset = ruleset.log_new_exec(true).map_err(|e| {
+            NonoError::SandboxInit(format!(
+                "Command sandbox execute restriction: cannot request new-exec audit logging: {e}"
+            ))
+        })?;
+    }
+
     let status = ruleset.restrict_self().map_err(|e| {
         NonoError::SandboxInit(format!(
             "Command sandbox execute restriction: restrict_self failed: {e}"
         ))
     })?;
+
+    debug!(
+        "Command sandbox execute restriction: new-exec audit logging = {}",
+        status.log_new_exec
+    );
 
     ensure_execute_restriction_fully_enforced(status.ruleset)?;
 
@@ -4947,6 +5031,98 @@ mod tests {
         assert_eq!(
             report[2], 1,
             "connect to a socket under a read-only grant must be denied"
+        );
+    }
+
+    /// `log_new_exec(true)` must not cost enforcement on a kernel that supports
+    /// it, and the status it reports must match what this build requested.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn landlock_log_new_exec_requested_matches_restrict_self() {
+        // This build does call log_new_exec(true); the constant says so without
+        // a syscall, and the rest of this test checks the kernel agrees.
+        const {
+            assert!(LANDLOCK_LOG_NEW_EXEC_REQUESTED);
+        }
+
+        let Ok(detected) = detect_abi() else {
+            return;
+        };
+        if !detected.has_audit_logging() {
+            return;
+        }
+
+        // restrict_self() is irreversible, so probe in a forked child.
+        let mut report_pipe = [0; 2];
+        // SAFETY: report_pipe points to two writable file descriptor slots.
+        assert_eq!(unsafe { libc::pipe(report_pipe.as_mut_ptr()) }, 0);
+
+        // SAFETY: fork is used in a test helper; the child exits via _exit.
+        let child_pid = unsafe { libc::fork() };
+        assert!(child_pid >= 0, "fork() failed");
+
+        if child_pid == 0 {
+            // SAFETY: inherited descriptor in the child.
+            unsafe { libc::close(report_pipe[0]) };
+
+            let payload = match Ruleset::default()
+                .set_compatibility(CompatLevel::HardRequirement)
+                .handle_access(AccessFs::from_all(detected.abi))
+                .and_then(|r| r.create())
+                .and_then(|r| r.log_new_exec(true))
+                .and_then(|r| r.restrict_self())
+            {
+                Ok(status) => [
+                    u8::from(status.ruleset == landlock::RulesetStatus::FullyEnforced),
+                    u8::from(status.log_new_exec),
+                ],
+                Err(_) => [u8::MAX, u8::MAX],
+            };
+
+            // SAFETY: payload is a valid buffer and report_pipe[1] is the write end.
+            let wrote = unsafe {
+                libc::write(
+                    report_pipe[1],
+                    payload.as_ptr().cast::<libc::c_void>(),
+                    payload.len(),
+                )
+            };
+            // SAFETY: close the inherited pipe fd; _exit terminates the child.
+            unsafe {
+                libc::close(report_pipe[1]);
+                libc::_exit(i32::from(wrote != 2));
+            }
+        }
+
+        // SAFETY: parent no longer writes to the pipe.
+        unsafe { libc::close(report_pipe[1]) };
+
+        let mut payload = [0_u8; 2];
+        // SAFETY: payload is a valid writable buffer; report_pipe[0] is the read end.
+        let read_result = unsafe {
+            libc::read(
+                report_pipe[0],
+                payload.as_mut_ptr().cast::<libc::c_void>(),
+                payload.len(),
+            )
+        };
+        // SAFETY: parent is done reading from the pipe.
+        unsafe { libc::close(report_pipe[0]) };
+        assert_eq!(read_result, 2, "failed to read restrict_self report");
+
+        let mut child_status = 0;
+        // SAFETY: child_pid is the pid returned by fork in the parent.
+        let waited = unsafe { libc::waitpid(child_pid, &mut child_status, 0) };
+        assert_eq!(waited, child_pid, "waitpid() failed");
+
+        assert_eq!(
+            payload[0], 1,
+            "requesting log_new_exec must not degrade enforcement on an ABI >= 7 host"
+        );
+        assert_eq!(
+            payload[1],
+            u8::from(LANDLOCK_LOG_NEW_EXEC_REQUESTED),
+            "RestrictionStatus.log_new_exec disagrees with LANDLOCK_LOG_NEW_EXEC_REQUESTED"
         );
     }
 
