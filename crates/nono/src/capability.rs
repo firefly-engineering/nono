@@ -890,6 +890,11 @@ pub enum NetworkMode {
     /// Seatbelt deny network* on macOS).
     Blocked,
     /// All network access allowed (no filtering)
+    ///
+    /// On macOS: IP only, `(allow network-outbound (remote ip))`. Seatbelt
+    /// counts a unix-socket connect(2) as network-outbound, so a pathname
+    /// socket is reachable only through a [`UnixSocketCapability`], plus
+    /// the mDNSResponder socket DNS needs.
     #[default]
     AllowAll,
     /// Only localhost TCP to the specified port is allowed for outbound.

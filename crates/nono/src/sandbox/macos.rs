@@ -913,8 +913,8 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
             profile.push_str("(allow system-socket)\n");
             // IP only: Seatbelt classifies a unix-socket connect(2) as
             // network-outbound too, and a blanket allow would reach every
-            // credential oracle on the host (ssh-agent, gpg-agent,
-            // docker.sock). Unix sockets take the explicit-grant path below.
+            // socket on the host (ssh-agent, gpg-agent, docker.sock). Unix
+            // sockets take the explicit-grant path below.
             // The resolver's grant is unconditional here: block_dns() has no
             // effect in AllowAll, as documented.
             profile.push_str("(allow network-outbound (remote ip))\n");
@@ -2360,7 +2360,7 @@ mod tests {
 
     #[test]
     fn test_generate_profile_allow_all_with_localhost_ports() {
-        // AllowAll is unchanged by localhost ports — all network already allowed
+        // AllowAll is unchanged by localhost ports — all IP already allowed
         let caps = CapabilitySet::new().allow_localhost_port(3000);
         let profile = generate_profile(&caps).unwrap();
 
